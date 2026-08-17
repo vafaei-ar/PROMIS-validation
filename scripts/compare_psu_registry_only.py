@@ -5,6 +5,11 @@ This is the primary apples-to-apples PSU equivalence analysis because Aabila's
 cohort is effectively registry-restricted, whereas the canonical harmonized PSU
 cohort also includes non-registry EHR stroke patients.
 
+The registry-positive patient ID set is derived once from canonical
+stroke_cohort_final and then applied to every canonical layer. This allows
+layers such as outcomes_flags, which do not themselves contain the
+in_stroke_registry column, to be compared correctly.
+
 Imputed data are intentionally excluded.
 """
 from __future__ import annotations
@@ -53,6 +58,24 @@ def norm_id(s: pd.Series) -> pd.Series:
     return s.astype("string").str.strip()
 
 
+def registry_ids_from_final(canonical_root: Path) -> set[str]:
+    final_path = first_existing(canonical_root, "stroke_cohort_final.parquet")
+    if final_path is None:
+        raise FileNotFoundError(
+            f"Cannot derive registry IDs: stroke_cohort_final.parquet not found under {canonical_root}"
+        )
+
+    final = pd.read_parquet(final_path).copy()
+    if "in_stroke_registry" not in final.columns:
+        raise KeyError(f"{final_path} has no in_stroke_registry column")
+
+    key = choose_key(final)
+    ids = set(norm_id(final.loc[final["in_stroke_registry"] == 1, key]).dropna())
+    if not ids:
+        raise ValueError("Canonical final cohort contains no registry-positive patient IDs")
+    return ids
+
+
 def diff_mask(a: pd.Series, b: pd.Series, atol: float, rtol: float) -> pd.Series:
     a_na = a.isna()
     b_na = b.isna()
@@ -82,6 +105,7 @@ def compare_layer(
     layer: str,
     canonical_path: Path,
     aabila_path: Path,
+    registry_ids: set[str],
     out_dir: Path,
     atol: float,
     rtol: float,
@@ -91,12 +115,11 @@ def compare_layer(
     ck = choose_key(c)
     ak = choose_key(a)
 
-    if "in_stroke_registry" not in c.columns:
-        raise KeyError(f"{canonical_path} has no in_stroke_registry column")
-
-    c = c[c["in_stroke_registry"] == 1].copy()
     c["__id"] = norm_id(c[ck])
     a["__id"] = norm_id(a[ak])
+
+    # Apply the registry membership derived from canonical final to every layer.
+    c = c[c["__id"].isin(registry_ids)].copy()
 
     if c["__id"].duplicated().any() or a["__id"].duplicated().any():
         raise ValueError(f"Duplicate patient IDs found in {layer}")
@@ -159,7 +182,9 @@ def compare_layer(
 
     summary = {
         "layer": layer,
-        "canonical_registry_patients": len(c_ids),
+        "canonical_registry_reference_ids": len(registry_ids),
+        "canonical_registry_patients_in_layer": len(c_ids),
+        "canonical_registry_ids_missing_from_layer": len(registry_ids - c_ids),
         "aabila_patients": len(a_ids),
         "shared_patients": len(shared),
         "canonical_registry_only": len(c_only),
@@ -189,6 +214,9 @@ def main() -> None:
     args = p.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    registry_ids = registry_ids_from_final(args.canonical_root)
+    print(f"Registry-positive patient IDs derived from canonical final: {len(registry_ids):,}")
+
     summaries = []
     missing = []
 
@@ -206,10 +234,18 @@ def main() -> None:
             continue
 
         print(f"Comparing {layer}\n  canonical: {cpath}\n  Aabila:    {apath}")
-        s = compare_layer(layer, cpath, apath, args.output_dir, args.atol, args.rtol)
+        s = compare_layer(
+            layer,
+            cpath,
+            apath,
+            registry_ids,
+            args.output_dir,
+            args.atol,
+            args.rtol,
+        )
         summaries.append(s)
         print(
-            "  registry={canonical_registry_patients:,}, Aabila={aabila_patients:,}, "
+            "  registry in layer={canonical_registry_patients_in_layer:,}, Aabila={aabila_patients:,}, "
             "shared={shared_patients:,}, C-only={canonical_registry_only:,}, A-only={aabila_only:,}, "
             "diff cols={columns_with_value_differences:,}, diff cells={total_different_cells:,}".format(**s)
         )
@@ -222,15 +258,16 @@ def main() -> None:
         "",
         f"Canonical pipeline commit: `{CANONICAL_COMMIT}`",
         "",
-        "Canonical rows are filtered to `in_stroke_registry == 1` before comparison.",
+        f"Registry-positive IDs derived from canonical final: **{len(registry_ids):,}**.",
+        "The same registry ID set is then applied to every canonical layer.",
         "Imputed data are intentionally excluded.",
         "",
-        "| Layer | Canonical registry | Aabila | Shared | C-only | A-only | Diff cols | Diff cells | Discordant patients |",
+        "| Layer | Canonical registry in layer | Aabila | Shared | C-only | A-only | Diff cols | Diff cells | Discordant patients |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for s in summaries:
         lines.append(
-            "| {layer} | {canonical_registry_patients:,} | {aabila_patients:,} | {shared_patients:,} | "
+            "| {layer} | {canonical_registry_patients_in_layer:,} | {aabila_patients:,} | {shared_patients:,} | "
             "{canonical_registry_only:,} | {aabila_only:,} | {columns_with_value_differences:,} | "
             "{total_different_cells:,} | {discordant_shared_patients:,} |".format(**s)
         )
