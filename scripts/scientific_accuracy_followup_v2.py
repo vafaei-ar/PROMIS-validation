@@ -1,24 +1,48 @@
 #!/usr/bin/env python3
 """Patient-level scientific-accuracy follow-up.
 
-Fixes two issues in the prior audit:
-1) Geisinger evidence summaries are aggregated once per patient/anchor/window
-   across all source date columns, rather than counting source-date-column rows.
-2) PSU upstream search tolerates pre-existing bookkeeping columns.
+Fixes prior audit issues:
+1) Uses the robust NA-safe text classifiers from scientific_accuracy_followup_fixed.
+2) Aggregates Geisinger evidence once per patient/anchor/window across all source date columns.
+3) PSU upstream search tolerates pre-existing bookkeeping columns.
+4) Clears only this audit's generated output files before each run so stale results cannot be mistaken for fresh output.
 
 All patient-level outputs remain under results/ and should not be committed.
 """
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import pandas as pd
 
 import scientific_accuracy_followup_fixed as fixed
 import scientific_accuracy_followup as base
 
 
+def clear_generated_outputs():
+    targets = [
+        base.OUT / 'geisinger_edges' / 'patient_level_evidence.csv',
+        base.OUT / 'geisinger_edges' / 'patient_level_summary.csv',
+        base.OUT / 'geisinger_edges' / 'configured_7d_anchor_comparison.csv',
+        base.OUT / 'psu_raw_dx' / 'diagnosis_file_inventory.csv',
+        base.OUT / 'psu_raw_dx' / 'discordant_patient_diagnosis_rows.csv',
+        base.OUT / 'psu_raw_dx' / 'direct_upstream_hits.csv',
+        base.OUT / 'summary_v2.json',
+    ]
+    for p in targets:
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def geisinger_patient_level():
-    info = fixed.geisinger_edge_exact_reconstruction_fixed()
+    # Patch the base workflow with the robust NA-safe classifiers, then run the
+    # actual base reconstruction function.
+    base.classify_imaging_text = fixed.classify_imaging_text_fixed
+    base.classify_lipid_text = fixed.classify_lipid_text_fixed
+    info = base.geisinger_edge_exact_reconstruction()
+
     outdir = base.OUT / 'geisinger_edges'
     detail_path = outdir / 'window_reconstruction_detail.csv'
     detail = pd.read_csv(detail_path, low_memory=False)
@@ -55,18 +79,28 @@ def geisinger_patient_level():
         summary[c + '_rate'] = summary[c] / summary['patients']
     summary.to_csv(outdir / 'patient_level_summary.csv', index=False)
 
-    # Direct canonical-vs-Aabila comparison at the configured 7-day window.
+    # Direct canonical-vs-Aabila comparison at the configured +/-7-day window.
     seven = patient[patient['window_days'].eq(7)].pivot_table(
         index='patient_id', columns='anchor', values='both_evidence', aggfunc='max'
     ).fillna(0).astype(int)
+    counts = {}
     if {'canonical', 'aabila'}.issubset(seven.columns):
         seven['aabila_only_both'] = ((seven['aabila'] == 1) & (seven['canonical'] == 0)).astype(int)
         seven['canonical_only_both'] = ((seven['canonical'] == 1) & (seven['aabila'] == 0)).astype(int)
         seven['both_anchors'] = ((seven['canonical'] == 1) & (seven['aabila'] == 1)).astype(int)
         seven['neither_anchor'] = ((seven['canonical'] == 0) & (seven['aabila'] == 0)).astype(int)
         seven.reset_index().to_csv(outdir / 'configured_7d_anchor_comparison.csv', index=False)
+        counts = {
+            'patients_7d': int(len(seven)),
+            'aabila_both_7d': int(seven['aabila'].sum()),
+            'canonical_both_7d': int(seven['canonical'].sum()),
+            'aabila_only_both_7d': int(seven['aabila_only_both'].sum()),
+            'canonical_only_both_7d': int(seven['canonical_only_both'].sum()),
+            'both_anchors_7d': int(seven['both_anchors'].sum()),
+            'neither_anchor_7d': int(seven['neither_anchor'].sum()),
+        }
 
-    return info | {'patient_level_rows': int(len(patient))}
+    return info | {'patient_level_rows': int(len(patient))} | counts
 
 
 def psu_upstream_raw_dx_search_fixed():
@@ -101,7 +135,6 @@ def psu_upstream_raw_dx_search_fixed():
         if not m.any():
             continue
         h = df.loc[m].copy()
-        # Assign instead of insert so reruns / nested derived files cannot collide.
         h['__source_file'] = str(p)
         h['__derived_path'] = derived
         h['__id'] = base.norm(h[k])
@@ -134,6 +167,7 @@ def psu_upstream_raw_dx_search_fixed():
 
 def main():
     base.OUT.mkdir(parents=True, exist_ok=True)
+    clear_generated_outputs()
     summary = {
         'geisinger_edge_reconstruction': geisinger_patient_level(),
         'psu_upstream_raw_dx': psu_upstream_raw_dx_search_fixed(),
