@@ -1,0 +1,13 @@
+name: No patient data in Git
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  patient-data-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan tracked files for patient-level artifacts
+        run: python scripts/check_no_patient_data.py
